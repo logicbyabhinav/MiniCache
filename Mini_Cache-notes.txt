@@ -1,0 +1,299 @@
+================================================================================
+MINICACHE: PROJECT DESIGN NOTES & ARCHITECTURAL LOG
+================================================================================
+Project: MiniCache (Standalone Redis-like In-Memory Key-Value Store)
+Role: Educational, Standalone, Reusable Systems Project
+Supervisor: Antigravity AI
+Author: Student Developer
+Date: October 2026
+
+--------------------------------------------------------------------------------
+1. PROJECT PURPOSE & SCOPE
+--------------------------------------------------------------------------------
+The goal of this project is to build a standalone, in-memory caching system 
+inspired by Redis from first principles.
+
+Core objectives:
+  - Understand internal mechanics of caching: hashing, eviction, time-to-live 
+    (TTL), network byte-framing, and durability.
+  - Create a self-contained, standalone service that can be run independently 
+    and reused by ANY application (Node.js, Python, Java, Go, etc.) over TCP.
+  - Master system design, object-oriented programming (OOP), data structures, 
+    and concurrent programming in a serious portfolio project.
+
+--------------------------------------------------------------------------------
+2. LANGUAGE PREFERENCE: WHY JAVA?
+--------------------------------------------------------------------------------
+Decision: Java (JDK 21+)
+
+Rationale & Strategic Benefits:
+  1. Academic Synergy (Zero Context Switching):
+     - The developer is actively taking Java coursework and needs to master 
+       Object-Oriented Programming (OOP) and concurrency for academics.
+     - Using Java allows 100% of the project effort to directly reinforce 
+       college exams, assignments, and deep language mastery instead of dividing 
+       attention across unfamiliar languages (like Go or C++).
+
+  2. Practical OOP in Systems Engineering:
+     - Moves beyond toy textbook examples (e.g., Animal -> Dog) to real-world 
+       OOP patterns:
+       * Interface segregation: EvictionPolicy interface with LRU / FIFO / LFU implementations.
+       * The Command Pattern: Command interface with SetCommand, GetCommand, DelCommand.
+       * Encapsulation: Strict separation between network socket handling, protocol parsing, 
+         and in-memory storage.
+
+  3. Core Concurrency & Data Structures:
+     - Leverages Java's rich standard library: HashMap, custom Doubly Linked Lists, 
+       PriorityQueue (min-heap), Atomic primitives, and thread synchronization / locks.
+
+  4. Portability & Standalone Deployment:
+     - Packages into a clean, standalone executable JAR (`minicache.jar`).
+     - Can be launched on any OS with `java -jar minicache.jar --port 6379`.
+
+--------------------------------------------------------------------------------
+3. ARCHITECTURAL TOPOLOGY: WHERE DOES THE CACHE SIT?
+--------------------------------------------------------------------------------
+Clarification of a Common Architectural Misconception:
+  A cache like Redis or MiniCache is NOT an HTTP Reverse Proxy or API Gateway 
+  (such as Nginx, Cloudflare, or Varnish). 
+  It does NOT sit in front of the application server, and it does NOT intercept 
+  browser HTTP requests or manage user authentication and URL routing.
+
+Instead, MiniCache sits ALONGSIDE the database, BEHIND the Application Server:
+
+    [ Client / Web Browser ]
+               |
+               | (HTTP Requests: /login, /files, cookies, tokens)
+               v
+    +-----------------------------------------------------------+
+    |         Application Server (e.g., Node.js / Python)       |
+    |  - Handles HTTP Routing                                   |
+    |  - Authenticates Users (sessions, JWT, passwords)         |
+    |  - Executes Business Logic                                |
+    +-----------------------------+-----------------------------+
+                                  |
+              +-------------------+-------------------+
+              |                                       |
+    (1) Check Cache first                   (3) If Miss, fetch from DB
+              |                                       |
+              v                                       v
+    +----------------------+                +----------------------+
+    |      MiniCache       |                |   Primary Database   |
+    |   (In-Memory RAM)    |                | (Disk: SQLite/Postgres)|
+    |   Sub-millisecond    |                |  ~10-50 milliseconds |
+    +----------------------+                +----------------------+
+
+The Cache-Aside Pattern in Practice:
+  1. The browser requests data from the App Server via HTTP.
+  2. The App Server checks user permissions and queries MiniCache over TCP.
+  3. If HIT: MiniCache returns the data from RAM instantly (~0.2ms). 
+     The App Server returns the response to the user. The database is never touched.
+  4. If MISS: MiniCache returns NIL. The App Server reads from the disk database,
+     then sends a `SET key value EX ttl` command to MiniCache so future requests hit.
+
+--------------------------------------------------------------------------------
+4. CROSS-LANGUAGE COMPATIBILITY: HOW ANY LANGUAGE CAN USE MINICACHE
+--------------------------------------------------------------------------------
+TCP network sockets communicate via raw byte streams, NOT programming languages.
+Once the Java server listens on a TCP port (e.g., 6379), ANY application written 
+in ANY language can interact with it using standard TCP sockets.
+
+Examples:
+
+  * From Node.js (e.g., CloudVault app):
+      const net = require('net');
+      const client = net.createConnection({ port: 6379 });
+      client.write('GET user:100:profile\r\n');
+      client.on('data', data => console.log(data.toString()));
+
+  * From Python:
+      import socket
+      s = socket.socket()
+      s.connect(('localhost', 6379))
+      s.sendall(b'GET user:100:profile\r\n')
+      response = s.recv(1024).decode()
+
+  * From Terminal / Command Line:
+      telnet localhost 6379
+      # or using netcat
+      nc localhost 6379
+
+Conclusion:
+  MiniCache does NOT need to be "fully fledged" with HTTP, authentication, or 
+  routing. Its sole focus is blindingly fast, reliable in-memory key-value operations.
+
+--------------------------------------------------------------------------------
+5. SYSTEM ARCHITECTURE: THE LAYERS
+--------------------------------------------------------------------------------
+MiniCache is split into five decoupled layers:
+
+  1. Storage Engine Layer:
+     - Pure in-memory key-value dictionary.
+     - Supports basic types (Strings, Integers) and complex types (Lists, Hashes).
+     - Manages entry metadata (creation time, TTL, access frequency).
+
+  2. Expiry Layer (Dual Strategy):
+     - Lazy Expiry: Check expiration deadline on access. If expired, purge & return miss.
+     - Active Expiry: Periodic non-blocking background task sweeps and removes dead keys.
+
+  3. Memory Control & Eviction:
+     - Tracks estimated memory usage.
+     - When memory threshold is exceeded, evicts items based on an LRU 
+       (Least Recently Used) policy implemented via Doubly Linked List + Map.
+
+  4. Protocol & Networking Layer:
+     - TCP Socket listener (`ServerSocket`).
+     - Framed command parser that converts byte streams into structured commands.
+     - Serializes standard responses (OK, Errors, Bulk Strings, Integers).
+
+  5. Durability Layer (AOF - Append-Only Log):
+     - Every mutating command (SET, DEL, etc.) is appended to a log on disk.
+     - On server startup, replaying the log rebuilds full in-memory state.
+
+--------------------------------------------------------------------------------
+6. PHASE 0 ASSIGNMENTS & DISCUSSIONS (STATUS: COMPLETED)
+--------------------------------------------------------------------------------
+  [RESOLVED] Q1. Data Model (The CacheEntry):
+      See Section 7 below for the full deep dive into RAM, HashMaps, 
+      and the CacheEntry envelope structure.
+
+  [RESOLVED] Q2. Distinguishing Missing vs. Null:
+      - Internal API: `hasKey(key)` checks existence regardless of value.
+      - Wire Protocol: A missing key returns `NIL` (Redis `$-1\r\n`).
+        An existing key with an empty/null value returns an empty string or status.
+      - Hash Collisions: Handled via Chaining (linked buckets in the hash map).
+
+  [RESOLVED] Q3. Core Commands:
+      Defined in Section 8 below (PING, SET, GET, DEL, EXISTS).
+
+--------------------------------------------------------------------------------
+8. CORE COMMAND GRAMMAR SPECIFICATION (v1)
+--------------------------------------------------------------------------------
+All commands are transmitted as text lines ending with `\r\n` (CRLF).
+
+1. PING (Health Check)
+   - Syntax: PING
+   - Success: +PONG\r\n
+   - Purpose: Liveness and connectivity check.
+
+2. SET (Store key-value)
+   - Syntax: SET <key> <value> [EX <seconds>]
+   - Success: +OK\r\n
+   - Error: -ERR wrong number of arguments\r\n
+   - Note: Optional `EX <seconds>` sets time-to-live.
+
+3. GET (Retrieve key-value)
+   - Syntax: GET <key>
+   - Success: $<length>\r\n<value>\r\n  (e.g., $5\r\nhello\r\n)
+   - Miss: $-1\r\n (NIL)
+
+4. DEL (Delete key)
+   - Syntax: DEL <key>
+   - Success: :1\r\n (integer 1 if removed)
+   - Not Found: :0\r\n (integer 0 if key didn't exist)
+
+5. EXISTS (Check key existence)
+   - Syntax: EXISTS <key>
+   - Success: :1\r\n (integer 1 if key exists)
+   - Not Found: :0\r\n (integer 0 if key does not exist)
+
+--------------------------------------------------------------------------------
+
+
+--------------------------------------------------------------------------------
+7. DSA FOUNDATIONS: ARRAYS, HASHMAPS, AND THE CACHEENTRY OBJECT
+--------------------------------------------------------------------------------
+A. How Computers Store Data in RAM (The Array of Lockers):
+   - Think of RAM as a long continuous row of numbered lockers:
+       Locker Index:  [ 0 ]   [ 1 ]   [ 2 ]   [ 3 ]   [ 4 ] ...
+   - In programming, this numbered row is an ARRAY.
+   - When given a number (e.g., "open locker 3"), the CPU finds it INSTANTLY.
+   - This instant, fixed-time access is called O(1) Constant Time.
+
+B. The Problem with Real-World Keys:
+   - In applications, we do not ask for "Locker #3".
+   - We ask for strings/names: "product:iphone15", "session:abc123xyz", "user:john".
+   - How does a computer turn a STRING into a LOCKER NUMBER?
+
+C. The Hash Function (The Locker Calculator):
+   - A Hash Function is a mathematical algorithm that converts any string 
+     of text into an integer:
+       Key: "product:iphone15"  ---> [ Hash Function ] ---> Locker #3
+       Key: "user:john"         ---> [ Hash Function ] ---> Locker #1
+   - This enables O(1) instant lookup by name! 
+   - A data structure that combines an Array with a Hash Function is called a 
+     HASH TABLE (or HASHMAP).
+
+D. What Lives in the Locker? The `CacheEntry` Envelope:
+   - Instead of throwing raw text into a locker, we place an "Envelope" inside.
+   - In Java, that envelope is an Object instantiated from the `CacheEntry` class.
+
+   Structure of the CacheEntry Envelope:
+   +-----------------------------------------------------------------------+
+   |                             CacheEntry                                |
+   |                                                                       |
+   |  key:             "product:iphone15"   (String)                       |
+   |  value:           "$999"               (Object / String)              |
+   |  expiresAt:       1728562200000        (long - timestamp in ms)       |
+   |  lastAccessedAt:  1728560400000        (long - timestamp in ms)       |
+   |  sizeBytes:       48                   (long - memory in bytes)       |
+   +-----------------------------------------------------------------------+
+
+E. Why Every Field on the Envelope Exists:
+   1. `key`: The label on the envelope. Used to confirm that this is the exact 
+      key requested (guarding against hash collisions where two different 
+      keys land in the same locker).
+   2. `value`: The actual payload/content being cached.
+   3. `expiresAt`: Absolute deadline in milliseconds (e.g., using monotonic or 
+      system clock). When accessed, if CurrentTime > expiresAt, the entry is dead.
+   4. `lastAccessedAt`: Timestamp of the last read/write. Used by the LRU 
+      (Least Recently Used) eviction algorithm to evict the coldest data.
+   5. `sizeBytes`: Estimated byte size of this entry, allowing the cache to 
+      track total RAM usage and enforce a maximum memory limit (e.g., 64 MB).
+
+--------------------------------------------------------------------------------
+9. JAVA OOP & CONCURRENCY MASTERY MAP (TIED DIRECTLY TO MINICACHE)
+--------------------------------------------------------------------------------
+User Practice Workspace: D:\Dev\JAVA DEV
+
+Every single topic in your college syllabus maps directly to a concrete feature 
+inside MiniCache. When you study each topic, this is the mental anchor to use:
+
+1. Encapsulation (Private fields, public getters/methods):
+   - In MiniCache: `CacheEntry` encapsulates `expiresAt` and `lastAccessedAt`.
+     No outside class can tamper with internal timestamps directly; they must 
+     call methods like `entry.isExpired()` or `entry.touch()`.
+
+2. Inheritance & Polymorphism (Abstract classes, interfaces):
+   - In MiniCache: The `EvictionPolicy` interface.
+     You define one common interface: `public interface EvictionPolicy { void recordAccess(String key); String evict(); }`
+     Then you write multiple implementations:
+       * `LruEvictionPolicy implements EvictionPolicy`
+       * `FifoEvictionPolicy implements EvictionPolicy`
+     The `StorageEngine` only talks to the interface—pure OOP polymorphism!
+
+3. Error Handling (try-catch-finally, custom Exceptions):
+   - In MiniCache: Protocol parsing and client command validation.
+     * When a client sends malformed input: throw custom `CommandParseException`.
+     * Handling unexpected client disconnects without crashing the server.
+
+4. Multithreading & Synchronization (Threads, synchronized, Locks):
+   - In MiniCache: Handling 100 simultaneous client socket connections.
+     * What happens when Thread A reads a key while Thread B deletes it?
+     * Learning race conditions and using `synchronized` blocks or `ReentrantLock` 
+       to make cache reads and writes thread-safe.
+
+5. Async vs. Synchronous Operations:
+   - In MiniCache:
+     * Synchronous: Memory reads and writes in the store.
+     * Asynchronous / Background: The active expiry sweeper running on a 
+       `ScheduledExecutorService` background timer without blocking client requests.
+
+6. Maps & Collections (HashMap, ConcurrentHashMap, List, Queue):
+   - In MiniCache: The foundational storage engine.
+     * `Map<String, CacheEntry>` for O(1) key lookups.
+     * `Queue` / Doubly Linked List for tracking LRU ordering.
+
+================================================================================
+
+
