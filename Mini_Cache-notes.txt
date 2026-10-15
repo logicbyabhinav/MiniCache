@@ -295,5 +295,87 @@ inside MiniCache. When you study each topic, this is the mental anchor to use:
      * `Queue` / Doubly Linked List for tracking LRU ordering.
 
 ================================================================================
+--------------------------------------------------------------------------------
+8. ENTERPRISE PACKAGE & DIRECTORY ARCHITECTURE (DOMAIN-DRIVEN DESIGN)
+--------------------------------------------------------------------------------
+Author: Student Developer & Antigravity AI
+Date: October 2026
 
+1. The Reverse Domain Name Standard (FQDN):
+   - Java package: `com.minicache` (derived from reverse domain convention 
+     introduced by Sun Microsystems in 1995 to guarantee zero global naming collisions).
+   - If other caching libraries exist on the classpath (e.g., Google Guava Cache, 
+     Ehcache, Apache Commons), `com.minicache` is mathematically isolated.
+
+2. Clean Source-to-Binary Separation (`src/` vs `bin/`):
+   - Rather than dumping flat `.java` files into a root directory, MiniCache 
+     enforces strict physical source trees:
+     
+     Mini-Cache/
+      ├── src/                               <--- Human-written source code ONLY
+      │    └── com/
+      │         └── minicache/
+      │              ├── Server.java         <--- Daemon main entrypoint
+      │              ├── core/               <--- Storage & Eviction domain
+      │              │    ├── StorageEngine.java
+      │              │    ├── CacheEntry.java
+      │              │    ├── EvictionPolicy.java
+      │              │    └── LruDoublyLinkedList.java
+      │              ├── protocol/           <--- Wire-level RESP parser domain
+      │              │    ├── RespParser.java
+      │              │    ├── RespSerializer.java
+      │              │    └── RespType.java
+      │              ├── command/            <--- Command Pattern domain
+      │              │    ├── Command.java
+      │              │    ├── SetCommand.java
+      │              │    ├── GetCommand.java
+      │              │    └── DelCommand.java
+      │              ├── net/                <--- TCP Socket & Connection domain
+      │              │    ├── TcpServer.java
+      │              │    └── ClientConnectionHandler.java
+      │              └── config/             <--- Runtime configuration
+      │                   └── ServerConfig.java
+      │
+      └── bin/                               <--- Compiled bytecode ONLY (.class)
+           └── com/
+                └── minicache/...
+
+3. Architectural Benefits of Package-by-Feature (Domain-Driven Design):
+   - Modularity: Each folder is a cohesive subsystem with a single responsibility.
+   - Enforcing Encapsulation via Package-Private Access:
+     * In `com.minicache.core`, the doubly linked list pointers (`prev`, `next`) 
+       inside `CacheEntry` are marked package-private (default access).
+     * Benefit: Only `LruDoublyLinkedList` and `StorageEngine` inside `com.minicache.core` 
+       can manipulate node pointers.
+     * The network layer (`com.minicache.net`) and commands (`com.minicache.command`) 
+       are physically forbidden by the Java compiler from touching pointers or corrupting 
+       the LRU chain! They can only interact with the cache via `StorageEngine`'s 
+       public interface (`get()`, `set()`, `del()`).
+
+4. Production Build & Execution Pipeline:
+   - Compilation from project root:
+     `javac -d bin -sourcepath src src/com/minicache/Server.java`
+     (`-d bin` writes to the output folder; `-sourcepath src` auto-resolves all 
+      dependent package classes across domains).
+   - Running the standalone daemon:
+     `java -cp bin com.minicache.Server --port 6379`
+   - Standalone Executable JAR Packaging:
+     `jar cvfe bin/minicache.jar com.minicache.Server -C bin .`
+     Run anywhere without IDE: `java -jar bin/minicache.jar`
+
+5. Hostel LAN Deployment Synergy:
+   - Verified College LAN Reality:
+     * Client isolation: DISABLED.
+     * Local peer-to-peer latency: <2ms.
+     * Local bandwidth: ~150 Mbps (~18.75 MB/s).
+     * Internet Quota: 500 MB/day limit per student.
+   - Zero-Quota Advantage:
+     Because local subnet traffic is routed directly by the hostel Wi-Fi AP / switch 
+     and never crosses the college WAN gateway, any device or student laptop on 
+     the floor can connect to your MiniCache instance over TCP:
+     `redis-cli -h 192.168.x.x -p 6379`
+     Thousands of operations per second run at 150 Mbps while consuming EXACTLY 0.00 MB 
+     of the student's 500 MB quota!
+
+================================================================================
 
