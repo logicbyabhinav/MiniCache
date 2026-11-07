@@ -324,4 +324,310 @@ if (key == null || key.trim().isEmpty()) {
 }
 ```
 
+---
+
+## ADR-009: In-Memory Storage Mechanics — Hash Table Physics, Collision Resolution, and Multi-Threaded Concurrency Synchronization
+
+### Context
+In `CacheEngine.java`, we must select the central data structure to store millions of `CacheObject` envelopes in memory. The storage structure must guarantee:
+1. True $O(1)$ average-case retrieval and insertion time by string keys.
+2. Mathematically sound collision handling when arbitrary strings map to the same internal array bucket.
+3. Thread-safe execution under simultaneous multi-client load across multi-core CPUs without memory corruption or global thread contention.
+
+---
+
+### Part 1: The Physics of Hashing & Array Mapping
+
+In hardware RAM, an array is the fastest physical structure because index access executes in a single CPU instruction via direct memory offset calculation:
+$$\text{Memory Address} = \text{Base Address} + (\text{Index} \times \text{Word Size})$$
+
+Because cache keys are strings (`"session:9a8b"`, `"user:101:profile"`) rather than sequential integers, the storage engine must transform variable-length text into a fixed array slot in $O(1)$ time.
+
+```
++-----------------------------------------------------------------------------------+
+|                              THE HASHING PIPELINE                                 |
++-----------------------------------------------------------------------------------+
+| [ Key: "user:101" ]                                                               |
+|        |                                                                          |
+|        v                                                                          |
+| [ 1. Hash Function (hashCode()) ]                                                 |
+|      Polynomial rolling computation -> 32-bit signed integer (e.g. 1,842,918,342) |
+|        |                                                                          |
+|        v                                                                          |
+| [ 2. Bitwise Index Masking ]                                                      |
+|      Index = hash & (N - 1)  (where capacity N = 16)                              |
+|      1,842,918,342 & 00001111_2 = 6                                               |
+|        |                                                                          |
+|        v                                                                          |
+| [ 3. Direct RAM Array Bucket ]                                                    |
+|      Jumps directly to Bucket 6 in 1 CPU instruction                              |
++-----------------------------------------------------------------------------------+
+```
+
+#### Why Capacity Must Be a Power of 2 ($N = 2^k$):
+Standard modulo arithmetic (`hash % N`) requires an expensive integer division instruction on hardware CPUs (~15 to 40 CPU clock cycles).
+When capacity $N$ is strictly a power of 2 ($16, 32, 64, \dots$):
+$$N - 1 = 2^k - 1 = \underbrace{000\dots0111\dots1}_{k \text{ ones}}$$
+Performing a bitwise AND (`hash & (N - 1)`) masks out all high bits and preserves only the lowest $k$ bits, mathematically guaranteeing that the result falls in $[0, N - 1]$. A bitwise AND executes in a **single CPU cycle ($0.3\text{ to }0.5\text{ ns}$)**.
+
+---
+
+### Part 2: Collision Resolution Mechanics (Separate Chaining)
+
+The **Pigeonhole Principle** dictates that mapping an infinite domain of strings into a finite 32-bit integer space (and subsequently into $N$ buckets) will inevitably produce collisions:
+$$\text{Hash}(\text{"Alice"}) \longrightarrow \text{Bucket } 4$$
+$$\text{Hash}(\text{"Bob"}) \longrightarrow \text{Bucket } 4$$
+
+#### Physical Memory Representation:
+Java resolves this collision through **Separate Chaining**. A bucket does not store a lone element; it stores the head pointer of a singly linked list composed of `Node<K, V>` objects:
+
+```
+Bucket Array:
+[ 0 ] -> null
+[ 1 ] -> null
+[ 2 ] -> null
+[ 3 ] -> null
+[ 4 ] -> [ Node 1 ] -----------------------------> [ Node 2 ] -> null
+         - hash: 1842918342                         - hash: 994821044
+         - key:  "Alice"                            - key:  "Bob"
+         - val:  CacheObject@0x100                  - val:  CacheObject@0x200
+         - next ------------------------------------+
+[ 5 ] -> null
+```
+
+#### Lookup Invariant:
+When executing `get("Bob")`:
+1. **Direct Leap ($O(1)$):** Hash is evaluated $\to$ CPU immediately addresses Bucket 4.
+2. **Chain Traversal:**
+   - Node 1 inspected: `key.equals("Alice")` is `false`. CPU follows `node1.next`.
+   - Node 2 inspected: `key.equals("Bob")` is `true`. CPU returns `node2.val`.
+
+#### Java 8 Treeification Guard:
+If an adversarial client floods the cache with keys intentionally designed to produce identical bucket indices (a Hash DoS attack), a linked list degrades from $O(1)$ to $O(N)$.
+- **Threshold Rule:** When any bucket's chain length reaches **`TREEIFY_THRESHOLD = 8`** and total table capacity $\ge 64$, Java automatically converts the linked list into a balanced **Red-Black Binary Search Tree**.
+- **Result:** Worst-case lookup time is strictly bound to **$O(\log N)$**.
+
+---
+
+### Part 3: Concurrency Hazards in Plain `HashMap`
+
+A plain `java.util.HashMap` is strictly designed for single-threaded execution. In a network server like MiniCache where dozens of client sockets run on parallel worker threads, `HashMap` fails with severe corruption:
+
+#### Hazard 1: Lost Updates (The Race Condition)
+Suppose Bucket 4 is currently empty (`null`). Thread 1 and Thread 2 execute simultaneously:
+
+```
+Timeline:
+Thread 1 (Worker A)                        Thread 2 (Worker B)
+------------------------------------       ------------------------------------
+1. Inspects Bucket 4: sees null            
+                                           1. Inspects Bucket 4: sees null
+2. Instantiates Node("Alice")              
+                                           2. Instantiates Node("Bob")
+3. Writes Bucket 4 = Node("Alice")         
+                                           3. Writes Bucket 4 = Node("Bob")! (OVERWRITE)
+```
+**Outcome:** Node `"Alice"` is completely unlinked from the bucket. The memory allocation is leaked, and Thread 1's data vanishes silently without throwing an exception.
+
+#### Hazard 2: Cyclic Pointer Corruption During Resizing (100% CPU Freeze)
+When a table exceeds its `threshold = capacity * loadFactor (0.75)`, it invokes `resize()`, doubling the bucket array and transferring existing linked lists.
+If Thread 1 and Thread 2 trigger `resize()` concurrently, their pointer updates interleave:
+```
+Node A.next = Node B
+Node B.next = Node A  <-- CIRCULAR CYCLE CREATED
+```
+The next `get()` request traversing this bucket enters an **infinite while-loop**, locking a CPU core at 100% utilization and causing the server to freeze permanently.
+
+---
+
+### Part 4: Concurrency Solutions Compared
+
+```
+Model 1: Hashtable / Collections.synchronizedMap(map)
+[ Thread 1 (Writing Key A) ] --------> [ ACQUIRES GLOBAL LOCK (this) ]
+                                                   |
+[ Thread 2 (Reading Key B) ] --------> BLOCKED! (Must wait for Thread 1)
+[ Thread 3 (Writing Key C) ] --------> BLOCKED! (Must wait for Thread 1)
+```
+*Verdict:* **Coarse-Grained Bottleneck.** A single global monitor lock forces all multi-core processors into a single-file sequential queue. Unacceptable for high-throughput caching.
+
+```
+Model 2: java.util.concurrent.ConcurrentHashMap (Lock Striping & Fine-Grained Locks)
+[ Thread 1 (Writing to Bucket 4) ] ---> [ Synchronizes ONLY Bucket 4 Node Head ]
+[ Thread 2 (Reading from Bucket 7) ] -> Reads via volatile memory (LOCK-FREE!)
+[ Thread 3 (Writing to Bucket 0) ] ---> [ Synchronizes ONLY Bucket 0 Node Head ]
+```
+*Verdict:* **Selected for MiniCache.**
+1. **Fine-Grained Bucket Locks:** Thread 1 and Thread 3 write concurrently without interference. Contention only occurs if two threads target the exact same bucket simultaneously.
+2. **Lock-Free Reads ($O(1)$):** The `val` and `next` pointers of `Node` are declared `volatile`. Reads traverse the memory barrier without acquiring locks, guaranteeing maximum multi-core CPU throughput.
+
+---
+
+### Part 5: Comprehensive Technical Comparison Matrix
+
+| Evaluation Criteria | `java.util.HashMap` | `java.util.Hashtable` | `Collections.synchronizedMap` | `ConcurrentHashMap` (Selected) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Thread Safety** | Non-Thread-Safe | Thread-Safe | Thread-Safe | **Thread-Safe** |
+| **Locking Strategy** | None (Corrupts state) | Coarse-Grained (`synchronized this`) | Coarse-Grained (`synchronized mutex`) | **Fine-Grained Lock Striping** |
+| **Read Concurrency** | Race condition risk | Blocks on writes | Blocks on writes | **100% Lock-Free (`volatile`)** |
+| **Write Concurrency** | Race condition risk | Single-threaded serialization | Single-threaded serialization | **Parallel writes across distinct buckets** |
+| **Null Keys / Values**| Allowed (`null -> 0`) | Throws `NullPointerException` | Allowed | **Disallowed** (prevents multi-thread ambiguity) |
+| **Rehashing Hazard** | Infinite loop / memory leak | Safe but locks whole table | Safe but locks whole table | **Thread-safe incremental multi-threaded transfer** |
+| **Collision Worst-Case**| $O(N)$ or $O(\log N)$ (single-threaded) | $O(N)$ | $O(N)$ | **$O(\log N)$ (Red-Black Tree)** |
+| **Architectural Role** | Local single-thread utility | Obsolete Java 1.0 legacy | Basic synchronized wrapper | **Production Systems Middleware Core** |
+
+---
+
+## ADR-010: Separation of the Storage Cabinet (`CacheMap`) from the Policy Controller (`CacheEngine`)
+
+### Context
+When implementing `CacheEngine.java`, a critical design decision was raised:
+Should `CacheEngine` directly implement the raw hash table internals (arrays, hashing math, collision buckets), or should the storage container be decoupled into a dedicated `CacheMap` class?
+
+### The Pluggable Cabinet Architecture
+We decided to decouple the engine into two specialized components:
+1. **`CacheMap.java` (The Storage Cabinet):**
+   - Strictly responsible for physical RAM storage.
+   - Holds the raw array of buckets (`Node[] table`).
+   - Implements polynomial rolling hash functions and bitwise index masking (`hash & (capacity - 1)`).
+   - Manages collision chaining via `Node.next` pointers.
+   - Manages dynamic resizing and rehashing when load factor $\ge 0.75$.
+2. **`CacheEngine.java` (The Store Manager & Policy Controller):**
+   - Manages `CacheMap` as its internal cabinet.
+   - Governs higher-order caching policies:
+     - **Dual Expiration Mechanics:** Lazy expiration on read (`get()`) + Active background sweeping thread.
+     - **LRU Eviction Coordination:** $O(1)$ Doubly Linked List with Sentinel nodes.
+     - **Memory Accounting:** Tracking entry counts and memory budgets.
+
+```
++-----------------------------------------------------------------------------------+
+|                        CacheEngine (Policy Controller)                            |
+|  - Coordinates TTL Expiration (Lazy + Active Cleaner)                            |
+|  - Coordinates O(1) LRU Eviction Queue                                            |
+|                               |                                                   |
+|                               v  (Delegates raw storage)                          |
+|                 CacheMap (The Storage Cabinet)                                    |
+|                 - Raw Array: Node[] table                                         |
+|                 - Polynomial Rolling Hash Function                                |
+|                 - Collision Resolution via Chaining                               |
+|                 - Dynamic Array Resizing & Rehashing                              |
++-----------------------------------------------------------------------------------+
+```
+
+### Architectural Benefits:
+1. **Separation of Concerns:** Low-level memory indexing (`CacheMap`) is completely separated from cache lifecycle policies (`CacheEngine`).
+2. **Pluggable Evolution:** We build `CacheMap` from raw arrays first to master fundamental DSA mechanics. Later, upgrading the backing cabinet to `ConcurrentHashMap` or off-heap memory requires zero rewrites of `CacheEngine`'s eviction or expiration logic.
+3. **Transparent Debugging:** If an item cannot be found or collides, we inspect `CacheMap`. If an item is evicted prematurely or fails TTL deadlines, we inspect `CacheEngine`.
+
+---
+
+## ADR-011: Intrusive Linked List Architecture vs. Generic Node Wrappers (Elimination of Secondary Allocation & Zero-Hop Collision Chaining)
+
+### Context
+When implementing collision resolution in `CacheMap.java`, the traditional Java textbook pattern uses an internal wrapper class `Node`:
+```java
+// Traditional Textbook Model:
+class Node {
+    String key;
+    CacheObject value;
+    Node next;
+}
+```
+A design critique was raised: wrapping `CacheObject` inside a secondary `Node` forces the CPU to chase two pointers across the heap (`store[i] -> Node -> CacheObject`) and wastes 16 bytes of JVM object header overhead per entry.
+
+### Analysis: Intrusive Data Structures in Systems Engineering
+In high-performance systems (such as the Linux kernel's `list_head` and Redis's internal `robj`), data structures are often **intrusive**:
+- In an **intrusive linked list**, the data object itself embeds the link pointers (`next`), rather than being wrapped inside an external container.
+- Java's `HashMap<K, V>` cannot do this because it is generic and cannot modify arbitrary user classes `V`.
+- In MiniCache, because we own both `CacheObject` and `CacheMap`, we can embed `next` directly inside `CacheObject`.
+
+```
+Textbook Wrapper Model:
+Bucket[i] ---> [ Node Object (16-byte header) ]
+                     |
+                     +---> [ CacheObject on Heap ] ---> String Value
+
+Intrusive Model (Selected):
+Bucket[i] ---> [ CacheObject on Heap (embeds .next) ] ---> String Value
+```
+
+### Quantified Advantages:
+1. **Zero Intermediate Allocations:** Eliminates $N$ wrapper objects on the heap. For 1,000,000 keys, this saves 16 MB of JVM object header overhead and reduces GC scan cycles.
+2. **Zero-Hop Cache Locality:** Finding an entry in a collision chain jumps directly from `store[i]` to `CacheObject`. The CPU loads all fields (`key`, `value`, `expiresAt`, `next`) in a single CPU cache line.
+3. **Architectural Purity:** `CacheMap` becomes a direct array: `private CacheObject[] store = new CacheObject[capacity];`.
+
+### Decision: Evaluation & Subsequent Reversion in ADR-012
+While the intrusive model offered theoretical zero-allocation advantages, it fundamentally blurred domain boundaries by polluting the data model with infrastructure pointers. See ADR-012 for the final architectural consensus.
+
+---
+
+## ADR-012: Domain Purity & Single Responsibility — Reversion to `Node` Wrappers ("Books Cannot Make a Shelf")
+
+### Context
+Following ADR-011, `CacheObject` was evaluated with an intrusive `public CacheObject next;` field. A critical domain design conflict was identified:
+- A `CacheObject` is fundamentally a **Domain Data Envelope** representing cached business payload, expiration timestamps, and access metadata.
+- Forcing `CacheObject` to carry `.next` pointers compels the data entity to act as a linked-list collection node.
+- As captured by developer Abhinav: *"Books cannot make a shelf."* The data stored on a shelf must not be polluted with the mechanical fixtures of the bookcase.
+
+### Analysis: Domain Model vs. Collection Infrastructure
+
+```
+Violated Responsibility (Intrusive):
+[ CacheObject ] = Data Entity + Linked List Node (Dual Responsibility)
+
+Restored Responsibility (Node Wrapper):
+[ CacheObject ] = PURE DATA (Key, Value, TTL, Access Time)
+[ Node ]        = PURE INFRASTRUCTURE (Hook holding CacheObject + 'next' pointer)
+[ CacheMap ]    = PURE CONTAINER (Array of Node bucket chains)
+```
+
+1. **Clean Separation of Concerns:**
+   - `CacheObject` knows nothing about hashmaps, buckets, collision chains, or linked lists. It remains completely reusable across any storage back-end.
+   - `Node` is a private static implementation detail of `CacheMap`.
+2. **Mental Clarity & Maintenance:**
+   - Isolating collection pointers inside `Node` prevents cyclic reference bugs from leaking into cache serialization, logging, or LRU queues.
+   - Eliminates confusion regarding object hierarchies.
+
+### Decision
+We strictly enforce the **Single Responsibility Principle**.
+- `CacheObject` remains 100% pure (no `next` field).
+- `CacheMap` encapsulates `static class Store` to manage separate chaining collisions.
+- The shelf array is typed as `private Store[] store = new Store[capacity];`.
+
+---
+
+## ADR-013: Collision Resolution Mechanics — The Chasing Pointer Deletion Pattern & Pop-Style Atomic Removal
+
+### Context
+When implementing `remove(String key)` in `CacheMap.java`, separate chaining presents a structural challenge: removing a node from a singly linked list requires reconnecting the predecessor node (`previous`) directly to the successor node (`current.next`). In a singly linked list, pointers only face forward (`next`), making backward navigation impossible without tracking history.
+
+### The Mechanics: Two-Pointer Traversal ("Chasing Pointer Pattern")
+To delete an arbitrary node in $O(1)$ amortized time within a bucket chain:
+1. Two pointer references (`current` and `previous`) traverse the chain in tandem:
+   - `current` leads the inspection.
+   - `previous` trails exactly one step behind.
+2. **Head Node Removal ($current == previous$):**
+   - If the head node matches the target key, no predecessor exists.
+   - The bucket slot itself is updated: `store[index] = current.next`.
+   - The old head is unlinked and reclaimed by the JVM Garbage Collector.
+3. **Middle or Tail Node Removal ($current \ne previous$):**
+   - The predecessor's forward link is rewired to bypass the target: `previous.next = current.next`.
+   - The target node is isolated from the chain in a single atomic pointer write.
+
+```
+Middle Node Deletion:
+                 previous                     current
+                    |                            |
+                    v                            v
+store[index] -> [ Node A ] ----------------> [ Node B ] -> [ Node C ] -> null
+                    |                                          ^
+                    +------------------------------------------+
+                           (previous.next = current.next)
+```
+
+### Pop-Style Return Semantics
+Rather than returning a bare boolean (`true`/`false`), `remove(String key)` implements **Pop-Style Semantics**:
+- Returns the unlinked `CacheObject` on success, or `null` if the key was absent.
+- **Architectural Rationale:** `CacheEngine` (the policy controller) needs access to the removed object to prune it from the LRU Doubly Linked List, decrement memory tracking metrics, and log diagnostic statistics without issuing a redundant `get()` before `remove()`.
+
 
