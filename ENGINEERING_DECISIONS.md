@@ -630,4 +630,36 @@ Rather than returning a bare boolean (`true`/`false`), `remove(String key)` impl
 - Returns the unlinked `CacheObject` on success, or `null` if the key was absent.
 - **Architectural Rationale:** `CacheEngine` (the policy controller) needs access to the removed object to prune it from the LRU Doubly Linked List, decrement memory tracking metrics, and log diagnostic statistics without issuing a redundant `get()` before `remove()`.
 
+---
+
+## ADR-014: O(1) LRU Eviction via Doubly Linked List with Sentinels & Coordinated Lazy Expiration
+
+### Context
+When memory reaches `maxCapacity`, MiniCache must evict the Least Recently Used (LRU) entry. Searching through an array or hash map for the oldest timestamp is an $O(N)$ operation that would cause unacceptable latency spikes. To guarantee strict $O(1)$ performance for all cache operations, MiniCache coordinates an in-memory Doubly Linked List alongside `CacheMap`.
+
+### The Architecture: Doubly Linked List with Sentinel Boundaries
+`CacheEngine` maintains two dummy sentinel nodes: `head` (Most Recently Used / MRU) and `tail` (Least Recently Used / LRU).
+- **Sentinel Invariant:** The list is never empty; at minimum, `head.next = tail` and `tail.prev = head`. This completely eliminates null-pointer checks during boundary insertions and deletions.
+- **O(1) Insertion (`addToHead`):** New or accessed items are spliced right behind `head` in exactly 4 pointer assignments.
+- **O(1) Eviction (`eviction`):** When capacity is full and a new key arrives, the engine grabs `tail.prev`, deletes the key from `CacheMap`, and unhooks the node in 2 pointer assignments.
+- **O(1) Access Promotion (`moveToHead`):** When a key is accessed via `get()`, its corresponding `Node` is unhooked from its current position and spliced behind `head`.
+
+```
+[ HEAD Sentinel ] <=====> [ Node 1 (MRU) ] <=====> [ Node 2 ] <=====> [ Node 3 (LRU) ] <=====> [ TAIL Sentinel ]
+```
+
+### Direct Reference Coupling (Zero-Lookup Pointer Hop)
+To achieve $O(1)$ promotion during `get()` without maintaining a secondary reverse-lookup hash map:
+- `CacheObject` encapsulates a direct reference `protected Object lruNode`.
+- When `storage.get(key)` returns the `CacheObject`, `CacheEngine` directly casts `(Node) data.getLruNode()` and calls `moveToHead()`.
+- Lookup time to locate the LRU carriage is **0 nanoseconds**.
+
+### Coordinated Lazy Expiration
+When `get(key)` detects that `data.isExpired()` evaluates to `true`:
+1. `storage.remove(key)` removes the dead item from the storage cabinet.
+2. `removeNode((Node) data.getLruNode())` unlinks the expired carriage from the LRU track.
+3. The method returns `null` (Cache Miss) to the client.
+This ensures that dead items never linger as zombie nodes in the LRU queue.
+
+
 

@@ -13,17 +13,19 @@ public class CacheObject {
     protected String value;
     protected final long expiresAt;
     protected long lastAccessedAt;
+    protected Object lruNode;
 
-    public CacheObject(String key, String value) {
-        this(key, value, -1L);
+    public CacheObject(String key, String value, Object lruNode) {
+        this(key, value, -1L, lruNode);
     }
 
-    public CacheObject(String key, String value, long ttlSeconds) throws InvalidCacheObjectException {
+    public CacheObject(String key, String value, long ttlSeconds, Object lruNode) throws InvalidCacheObjectException {
         if (key == null || key.trim().isEmpty()) {
             throw new InvalidCacheObjectException("Key cannot be null or empty");
         } else {
             this.key = key;
             this.value = value;
+            this.lruNode = lruNode;
 
             final long currentTime = System.currentTimeMillis();
 
@@ -65,5 +67,9 @@ public class CacheObject {
 
     public long getLastAccessedAt() {
         return this.lastAccessedAt;
+    }
+
+    public Object getLruNode() {
+        return this.lruNode;
     }
 }
