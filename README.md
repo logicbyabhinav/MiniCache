@@ -109,18 +109,22 @@ Every item stored in MiniCache is wrapped in an atomic `CacheObject` envelope. I
 
 ### 4.2. The Pluggable Storage Cabinet (`CacheMap.java`)
 `CacheMap` is the custom in-memory hash table implemented from first principles:
-- **Raw Array:** `Node[] table` storing bucket heads.
-- **Separate Chaining:** Handles collisions via singly linked list nodes (`Node.next`).
-- **Hash Compression:** Uses polynomial rolling hashing with prime factor 31 and bitwise power-of-2 index compression (`hash & (capacity - 1)`).
+- **Raw Array:** `Store[] store` storing bucket heads.
+- **Separate Chaining:** Handles collisions via singly linked list nodes (`Store.next`).
+- **Configurable Buckets:** Defaults to 16 buckets with polynomial rolling hashing (`Math.abs(key.hashCode()) % buckets`).
+- **Two-Pointer Deletion:** Uses the chasing-pointer pattern (`previous` and `current`) with pop-style atomic removal.
 - **Pluggable Architecture:** Isolating the raw cabinet container allows MiniCache to be benchmarked with a custom array map first, and later seamlessly upgraded to `ConcurrentHashMap` or off-heap memory without altering controller logic.
 
 ### 4.3. The Policy Controller (`CacheEngine.java`)
-`CacheEngine` acts as the mastermind managing `CacheMap`:
+`CacheEngine` acts as the mastermind orchestrating `CacheMap` and caching rules:
+- **Thread Safety:** Core methods are strictly synchronized to ensure safe concurrent access across multi-threaded socket workers.
 - **Dual Expiration Mechanics:**
-  1. *Lazy Expiration:* On `get(key)`, the entry's expiration deadline is inspected. Expired entries are immediately pruned from `CacheMap` and return `null`.
-  2. *Active Expiration:* A background thread periodically samples keys and purges expired entries to prevent dead memory leaks.
-- **O(1) LRU Eviction:**
-  Uses a Doubly Linked List with Sentinel Head and Tail nodes combined with hash indexing to achieve strictly bound $O(1)$ node splicing and eviction under memory bounds.
+  1. *Lazy Expiration:* On `get(key)`, the entry's expiration deadline is inspected. Expired entries are immediately pruned from both `CacheMap` and the LRU queue and return `null`.
+  2. *Active Expiration:* A background sweeper periodically samples keys and purges expired entries to prevent dead memory leaks.
+- **O(1) LRU Eviction Queue:**
+  Uses a Doubly Linked List with Sentinel Head and Tail nodes (`head <=====> tail`).
+- **Zero-Hop Direct Reference Coupling:**
+  `CacheObject` holds a direct reference (`protected Object lruNode`) to its corresponding carriage in the LRU queue. Access promotion (`moveToHead`) and eviction (`removeNode`) execute in true $O(1)$ constant time with zero reverse-lookup hash tables.
 
 ---
 
@@ -137,10 +141,30 @@ Detailed first-principles reasoning and mathematical derivations are permanently
 - **ADR-008:** Fail-Fast Exception Architecture, Checked vs Unchecked, and Error Bubbling
 - **ADR-009:** Hash Table Physics, Collision Resolution, and Multi-Threading Concurrency
 - **ADR-010:** Separation of the Storage Cabinet (`CacheMap`) from the Policy Controller (`CacheEngine`)
+- **ADR-011:** Intrusive Linked List Architecture vs. Generic Node Wrappers
+- **ADR-012:** Domain Purity & Single Responsibility — "Books Cannot Make a Shelf"
+- **ADR-013:** Collision Resolution Mechanics — The Chasing Pointer Deletion Pattern & Pop-Style Atomic Removal
+- **ADR-014:** O(1) LRU Eviction via Doubly Linked List with Sentinels & Coordinated Lazy Expiration
 
 ---
 
-## 6. Project Directory Layout
+## 6. Implementation Progress & Roadmap
+
+- [x] **Pillar 3: Engine Layer (`com.minicache.engine`)** — *100% Complete & Tested*
+  - [x] `CacheObject.java`: Domain envelope, 64-bit epoch deadlines, access timestamps, fail-fast validation.
+  - [x] `CacheMap.java`: Custom hash table, bucket arrays, polynomial hashing, collision separate chaining, chasing-pointer deletion.
+  - [x] `CacheEngine.java`: Thread-safe controller, $O(1)$ LRU doubly linked list with sentinels, lazy TTL expiration, atomic delete, capacity guards.
+- [ ] **Pillar 2: Command Layer (`com.minicache.command`)** — *In Progress*
+  - [ ] `CommandHandler.java`: Redis command parsing (PING, SET, GET, DEL, EXISTS), syntax validation, RESP protocol serialization.
+- [ ] **Pillar 1: Server Layer (`com.minicache.server`)** — *Pending*
+  - [ ] `MiniCacheServer.java`: Multi-threaded TCP ServerSocket listener on port 6379, client worker thread lifecycle.
+- [ ] **Bootstrap Orchestration** — *Pending*
+  - [ ] `MiniCache.java`: Application entry point, CLI flags, graceful shutdown hooks.
+
+
+---
+
+## 7. Project Directory Layout
 
 ```text
 D:\Dev\Mini-Cache\

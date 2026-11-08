@@ -51,13 +51,13 @@ public class CacheEngine {
         addToHead(node);
     }
 
-    public void set(String key, String value) {
+    public synchronized void set(String key, String value) {
         set(key, value, -1L);
     }
 
     private boolean eviction() {
         Node oldest = tail.prev;
-        if(oldest == head){
+        if (oldest == head) {
             return false;
         }
         storage.remove(oldest.key);
@@ -65,19 +65,17 @@ public class CacheEngine {
         return true;
     }
 
-    public void set(String key, String value, long ttlSeconds) {
+    public synchronized void set(String key, String value, long ttlSeconds) {
         Node node = new Node(key);
         CacheObject data = new CacheObject(key, value, ttlSeconds, node);
-        
+
         if (storage.exists(key)) {
             CacheObject old = storage.get(key);
-            Node oldNode =(Node)old.getLruNode();
+            Node oldNode = (Node) old.getLruNode();
             removeNode(oldNode);
             storage.put(key, data);
             addToHead(node);
-        } 
-        
-        else {
+        } else {
             if (storage.size() >= maxCapacity) {
                 if (!eviction()) {
                     return;
@@ -88,7 +86,7 @@ public class CacheEngine {
         }
     }
 
-    public String get(String key) {
+    public synchronized String get(String key) {
         CacheObject data = storage.get(key);
         if (data != null) {
             Node link = (Node) data.getLruNode();
@@ -104,7 +102,7 @@ public class CacheEngine {
         return null; // Cache miss, data not found
     }
 
-        public boolean delete(String key) {
+    public synchronized boolean delete(String key) {
         CacheObject removed = storage.remove(key);
         if (removed != null) {
             removeNode((Node) removed.getLruNode());
@@ -113,15 +111,15 @@ public class CacheEngine {
         return false;
     }
 
-    public boolean exists(String key) {
+    public synchronized boolean exists(String key) {
         return get(key) != null;
     }
 
-    public int size() {
+    public synchronized int size() {
         return storage.size();
     }
 
-    public void clear() {
+    public synchronized void clear() {
         storage.clear();
         head.next = tail;
         tail.prev = head;
