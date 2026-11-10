@@ -661,5 +661,67 @@ When `get(key)` detects that `data.isExpired()` evaluates to `true`:
 3. The method returns `null` (Cache Miss) to the client.
 This ensures that dead items never linger as zombie nodes in the LRU queue.
 
+---
+
+## ADR-015: Redis Serialization Protocol (RESP) Parser & Length-Prefixed Framing Architecture
+
+### Context
+In designing client-server caching systems, transport formats range from plain newline-delimited text to JSON, Protobuf, and specialized wire protocols. MiniCache adopts the **Redis Serialization Protocol (RESP 2)** to provide native drop-in compatibility with the vast ecosystem of existing Redis tools (`redis-cli`, application client libraries, load balancers, and monitoring daemons).
+
+### The Challenge of Plain Text vs. Binary Safety
+In a naive plain-text protocol, commands and responses are terminated strictly by `\r\n`. This creates a severe limitation known as the **"Data Delimiter Collision"**:
+- If a stored value contains arbitrary user payloads (e.g., multiline JSON `{"k": "v\r\n"}` or serialized binary bytes), a receiver reading until `\r\n` prematurely truncates the transmission, corrupting subsequent protocol frames.
+
+### Architectural Solution: Length-Prefixed Framing (Bulk Strings)
+RESP solves this via length-prefixed framing. The server explicitly declares the byte length before emitting payload bytes:
+```text
+$<byte_length>\r\n<payload>\r\n
+```
+1. **Binary Safety**: The client parses the length integer first, then reads exactly that many bytes directly from the socket stream without parsing content.
+2. **Deterministic Memory Allocation ($O(1)$)**: When the client reads `$1048576\r\n`, it allocates a single 1MB memory buffer upfront rather than repeatedly resizing dynamic arrays.
+3. **Disambiguation of State**:
+   - Cache Miss / Expired Key: Evaluates to Null Bulk String (`$-1\r\n`).
+   - Empty String: Evaluates to Zero-length Bulk String (`$0\r\n\r\n`).
+   - String containing `"nil"`: Evaluates to 3-byte Bulk String (`$3\r\nnil\r\n`).
+
+### Dispatcher Routing & Command Arity Enforcement
+`CommandHandler` validates and dispatches commands through modern Java `switch` pattern expressions:
+- **`PING [msg]`**: Returns simple string `+PONG\r\n` or bulk string `$<len>\r\n<msg>\r\n`.
+- **`SET key val [EX seconds]`**: Enforces strict arity (3 or 5 tokens), validates integer seconds ($ttl > 0$), and returns `+OK\r\n`.
+- **`GET key`**: Single argument verification; queries `CacheEngine.get(key)`. Returns `$-1\r\n` on cache miss or lazy expiry; returns `$<len>\r\n<val>\r\n` on cache hit.
+- **`DEL key`**: Deletes entry; returns integer `:1\r\n` or `:0\r\n`.
+- **`EXISTS key`**: Probes existence without modifying LRU queue position; returns `:1\r\n` or `:0\r\n`.
+- **Unknown Command**: Fallback returns standardized `-ERR unknown command '<verb>'\r\n`.
+
+---
+
+## ADR-016: Multi-Threaded TCP ServerSocket & Graceful Lifecycle Architecture
+
+### Context
+In-memory caches serve high-throughput workloads with hundreds of client connections. A single-threaded listening loop that executes client requests synchronously blocks all other clients whenever one connection is idle or latency-bound.
+
+### Architectural Separation: Acceptor vs. Worker Pool
+`MiniCacheServer` separates connection-accepting from socket I/O handling:
+1. **Acceptor Loop (Main Server Thread)**:
+   - Executes an uninterrupted `serverSocket.accept()` loop on port `6379`.
+   - As soon as the OS completes a TCP 3-way handshake, `accept()` returns a dedicated client `Socket`.
+   - The connection is immediately handed off to an `ExecutorService` thread pool via `threadPool.submit(() -> handleClient(socket))`.
+2. **Client Worker Routine (`handleClient`)**:
+   - Each client connection is owned by an independent worker thread.
+   - Encapsulates `socket.getInputStream()` in `InputStreamReader` and `BufferedReader` for character-buffered line processing.
+   - Encapsulates `socket.getOutputStream()` in auto-flushing `PrintWriter` to guarantee immediate wire transmission.
+   - Loops on `in.readLine()` until EOF (`null`), signaling normal client disconnect.
+
+### Thread Safety Guarantee
+Concurrency is safely handled through the bottom-up design established in ADR-001 and ADR-014:
+- All mutating state operations in `CacheEngine` (`set`, `get`, `delete`, `exists`) are protected by object monitor locks via `synchronized`.
+- Parallel worker threads concurrently read from sockets and serialize RESP frames, but synchronize at the engine boundary, guaranteeing zero race conditions, pointer corruption, or dirty writes.
+
+### Graceful Daemon Shutdown Hook
+To prevent OS socket resource leaks and port rebind failures (`Address already in use`):
+- `MiniCache` registers a JVM shutdown hook (`Runtime.getRuntime().addShutdownHook(...)`).
+- On `SIGINT` (`Ctrl+C`) or `SIGTERM`, `server.stop()` flips `volatile boolean running = false`, closes `serverSocket` to unblock `.accept()`, and invokes `threadPool.shutdown()` to drain worker threads cleanly before the process exits with code 0.
+
+
 
 
