@@ -195,6 +195,16 @@ Recommended tags for this repository:
 
 ---
 
+## Roadmap & Future Versions
+
+MiniCache's forward engineering path is documented in **[ROADMAP.md](ROADMAP.md)**:
+* **v1.1.0**: Multi-line RESP 2 Array Parser (`*<count>\r\n`), active background TTL sweeping, and counter primitives (`INCR`/`DECR`/`MGET`/`MSET`).
+* **v1.2.0**: Durability via Append-Only File (AOF) write-ahead logging, `fsync` policies, and background compaction (`BGREWRITEAOF`).
+* **v1.3.0**: Rich collection primitives: Doubly-linked Lists, embedded Hash Maps, and Sets.
+* **v2.0.0**: Non-blocking Java NIO Reactor architecture (`Selector` event loop) and pipelining benchmarked against `redis-benchmark`.
+
+---
+
 ## License
 
 Released under the **[MIT License](LICENSE)**. Copyright (c) 2026 Abhinav Kishore.
